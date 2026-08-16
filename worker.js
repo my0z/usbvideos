@@ -401,7 +401,14 @@ async function generateSceneImage(prompt, env) {
   }
 }
 
-const KOREAN_TTS_VOICES = ['ko-KR-Wavenet-A', 'ko-KR-Wavenet-B', 'ko-KR-Wavenet-C', 'ko-KR-Wavenet-D'];
+// Chirp3-HD: Google의 최신 생성형 TTS, Wavenet보다 훨씬 인간미 있는 억양/호흡 표현.
+// 단점: speakingRate/pitch 파라미터를 아예 지원 안 함(넣으면 400 에러) — audioConfig는 인코딩만.
+const KOREAN_TTS_VOICES_NATURAL = [
+  'ko-KR-Chirp3-HD-Aoede', 'ko-KR-Chirp3-HD-Kore', 'ko-KR-Chirp3-HD-Leda',
+  'ko-KR-Chirp3-HD-Charon', 'ko-KR-Chirp3-HD-Puck', 'ko-KR-Chirp3-HD-Orus',
+];
+// Chirp3-HD가 실패할 경우(지역/쿼터 이슈 등) 대비한 예전 세대 폴백
+const KOREAN_TTS_VOICES_FALLBACK = ['ko-KR-Wavenet-A', 'ko-KR-Wavenet-B', 'ko-KR-Wavenet-C', 'ko-KR-Wavenet-D'];
 
 async function generateNarrationAudio(text, env) {
   if (!env.GOOGLE_TTS_API_KEY) {
@@ -409,23 +416,43 @@ async function generateNarrationAudio(text, env) {
     return null;
   }
   const trimmed = text.slice(0, 3000); // Google Cloud TTS는 요청당 5000바이트 제한이라 여유있게 자름
-  const voiceName = KOREAN_TTS_VOICES[Math.floor(Math.random() * KOREAN_TTS_VOICES.length)];
-  try {
+
+  const tryVoice = async (voiceName, useNaturalConfig) => {
+    const audioConfig = useNaturalConfig
+      ? { audioEncoding: 'MP3' } // Chirp3-HD는 속도/피치 파라미터 자체를 거부함
+      : { audioEncoding: 'MP3', speakingRate: 0.9 };
     const res = await fetch(`https://texttospeech.googleapis.com/v1/text:synthesize?key=${env.GOOGLE_TTS_API_KEY}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         input: { text: trimmed },
         voice: { languageCode: 'ko-KR', name: voiceName },
-        audioConfig: { audioEncoding: 'MP3', speakingRate: 0.9 },
+        audioConfig,
       }),
     });
     if (!res.ok) {
       const bodyText = await res.text();
-      console.log(`음성합성 실패(목소리: ${voiceName}): HTTP ${res.status} — ${bodyText.slice(0, 300)}`);
-      return null;
+      return { ok: false, error: `HTTP ${res.status} — ${bodyText.slice(0, 300)}` };
     }
-    const data = await res.json();
+    return { ok: true, data: await res.json() };
+  };
+
+  try {
+    const naturalVoice = KOREAN_TTS_VOICES_NATURAL[Math.floor(Math.random() * KOREAN_TTS_VOICES_NATURAL.length)];
+    let voiceName = naturalVoice;
+    let attempt = await tryVoice(naturalVoice, true);
+
+    if (!attempt.ok) {
+      console.log(`음성합성 실패(목소리: ${naturalVoice}): ${attempt.error} — 폴백 음성으로 재시도`);
+      voiceName = KOREAN_TTS_VOICES_FALLBACK[Math.floor(Math.random() * KOREAN_TTS_VOICES_FALLBACK.length)];
+      attempt = await tryVoice(voiceName, false);
+      if (!attempt.ok) {
+        console.log(`음성합성 폴백도 실패(목소리: ${voiceName}): ${attempt.error}`);
+        return null;
+      }
+    }
+
+    const data = attempt.data;
     if (!data?.audioContent) {
       console.log('음성합성 실패: 응답에 audioContent 없음 — raw: ' + JSON.stringify(data).slice(0, 300));
       return null;
