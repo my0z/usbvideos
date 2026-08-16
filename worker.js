@@ -60,7 +60,7 @@ const STYLE = `
   .slideshow .playbtn:hover{ background:rgba(0,0,0,0.8); }
 `;
 
-const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&display=swap" rel="stylesheet">`;
+const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&family=Black+Han+Sans&display=swap" rel="stylesheet">`;
 
 export default {
   async fetch(request, env, ctx) {
@@ -764,24 +764,33 @@ function splitTextIntoNChunks(text, n) {
     current.push(sentence);
     currentLen += sentence.length;
     if (currentLen >= target && chunks.length < n - 1) {
-      chunks.push(current.join(' ').trim());
+      chunks.push(current);
       current = [];
       currentLen = 0;
     }
   }
-  if (current.length) chunks.push(current.join(' ').trim());
-  while (chunks.length < n) chunks.push('');
+  if (current.length) chunks.push(current);
+  while (chunks.length < n) chunks.push([]);
   if (chunks.length > n) {
-    const overflow = chunks.splice(n - 1).join(' ').trim();
+    const overflow = chunks.splice(n - 1).flat();
     chunks.push(overflow);
   }
 
-  const rawWeights = chunks.map((c) => Math.max(c.length, 1)); // 빈 칸도 최소 노출시간은 보장
+  // 문장이 끝날 때마다 TTS가 짧게 쉬는 시간(정지)이 있는데, 글자수만 세면 이게 빠져서
+  // 문장이 여러 개 들어간 컷일수록 실제보다 더 짧게 잡히는 문제가 있었음.
+  // → 문장 하나당 "정지시간에 해당하는 글자수"를 가상으로 더해서 가중치를 보정.
+  const PAUSE_EQUIVALENT_CHARS = 6;
+  const chunkTexts = chunks.map((sents) => sents.join(' ').trim());
+  const rawWeights = chunks.map((sents) => {
+    const chars = sents.reduce((sum, s) => sum + s.length, 0);
+    const pauseChars = sents.length * PAUSE_EQUIVALENT_CHARS;
+    return Math.max(chars + pauseChars, PAUSE_EQUIVALENT_CHARS); // 빈 칸도 최소 노출시간은 보장
+  });
   const sumWeights = rawWeights.reduce((a, b) => a + b, 0) || 1;
-  return chunks.map((text, i) => ({ text, weight: rawWeights[i] / sumWeights }));
+  return chunkTexts.map((text, i) => ({ text, weight: rawWeights[i] / sumWeights }));
 }
 
-function wrapCaptionLines(text, maxCharsPerLine = 26, maxLines = 3) {
+function wrapCaptionLines(text, maxCharsPerLine = 20, maxLines = 3) {
   const words = (text || '').split(/\s+/).filter(Boolean);
   const lines = [];
   let current = '';
@@ -799,36 +808,30 @@ function wrapCaptionLines(text, maxCharsPerLine = 26, maxLines = 3) {
   return lines.slice(0, maxLines);
 }
 
-// 자막 스타일: 평평한 검은 띠 대신 아래에서 위로 옅어지는 그라데이션 스크림 + 굵은 흰 글자에
-// 검은 외곽선(paint-order stroke)을 둘러서, 어떤 배경 사진 위에서도 가독성이 확보되도록 함.
+// 자막 스타일: mp4(ffmpeg drawtext)와 동일하게 Black Han Sans 굵은 서체 + 진한 배경 박스로 통일.
+// 그라데이션 대신 확실한 반투명 박스를 깔아서 어떤 사진 위에서도 대비가 확보되게 함.
 function buildCaptionedImageSvg(imageBuffer, caption) {
   const width = 1280;
   const height = 720;
   const dataUri = `data:image/jpeg;base64,${arrayBufferToBase64(imageBuffer)}`;
-  const lines = wrapCaptionLines(caption, 26, 3);
-  const fontSize = 38;
-  const lineHeight = 50;
-  const bottomPadding = 56;
+  const lines = wrapCaptionLines(caption, 20, 3);
+  const fontSize = 48;
+  const lineHeight = 60;
+  const boxPaddingV = 28;
   const textBlockHeight = lines.length * lineHeight;
-  const scrimHeight = lines.length ? textBlockHeight + bottomPadding + 40 : 0;
-  const firstLineY = height - bottomPadding - (lines.length - 1) * lineHeight;
+  const boxHeight = lines.length ? textBlockHeight + boxPaddingV * 2 : 0;
+  const boxY = height - boxHeight - 40;
+  const firstLineY = boxY + boxPaddingV + fontSize * 0.78;
   const tspans = lines
     .map((line, i) => `<tspan x="${width / 2}" y="${firstLineY + i * lineHeight}">${escapeXml(line)}</tspan>`)
     .join('');
   const captionMarkup = lines.length
-    ? `<defs>
-         <linearGradient id="capScrim" x1="0" y1="0" x2="0" y2="1">
-           <stop offset="0%" stop-color="#000000" stop-opacity="0"/>
-           <stop offset="55%" stop-color="#000000" stop-opacity="0.55"/>
-           <stop offset="100%" stop-color="#000000" stop-opacity="0.82"/>
-         </linearGradient>
-       </defs>
-       <rect x="0" y="${height - scrimHeight}" width="${width}" height="${scrimHeight}" fill="url(#capScrim)"/>
+    ? `<rect x="24" y="${boxY}" width="${width - 48}" height="${boxHeight}" rx="12" fill="#000000" fill-opacity="0.68"/>
        <text
-         font-family="'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif"
-         font-size="${fontSize}" font-weight="700" text-anchor="middle"
-         letter-spacing="0.2"
-         paint-order="stroke fill" stroke="rgba(0,0,0,0.85)" stroke-width="7" stroke-linejoin="round"
+         font-family="'Black Han Sans','Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif"
+         font-size="${fontSize}" font-weight="400" text-anchor="middle"
+         letter-spacing="0.3"
+         paint-order="stroke fill" stroke="rgba(0,0,0,0.9)" stroke-width="8" stroke-linejoin="round"
          fill="#ffffff"
        >${tspans}</text>`
     : '';
@@ -905,7 +908,7 @@ async function generateAndSavePost(topic, env) {
       images.push(key);
       captionWeights.push(chunk.weight);
       // SVG랑 똑같은 줄바꿈 규칙으로 미리 wrap해서 relay에 넘김 — mp4에도 동일한 자막이 그대로 들어가게
-      captionTexts.push(wrapCaptionLines(chunk.text, 26, 3).join('\n'));
+      captionTexts.push(wrapCaptionLines(chunk.text, 20, 3).join('\n'));
 
       // ffmpeg가 안정적으로 읽을 수 있게 자막 없는 순수 JPEG 원본도 별도 저장 (mp4 렌더링 전용, 자막은 relay가 drawtext로 입힘)
       const rawKey = `${slug}-raw-${i}.jpg`;
