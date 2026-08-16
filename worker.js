@@ -3,6 +3,7 @@
  * Veo 대신 Workers AI의 이미지생성(FLUX)+음성합성(MeloTTS)만 사용 — 사실상 무료, 폴링 크론 불필요(동기 처리)
  */
 
+
 const CF_ACCOUNT_ID = '709dcc6af36c8ee7b6d3d99e7a9fe422';
 const VEO_MODEL = 'veo-3.1-fast-generate-preview';
 const VIDEO_JOB_TIMEOUT_MS = 30 * 60 * 1000; // 30분 넘게 안 끝나면 포기
