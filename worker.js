@@ -71,6 +71,7 @@ export default {
       if (path === '/admin') return await renderAdminPage(env);
       if (path === '/admin/generate' && request.method === 'POST') return await handleGenerate(request, env);
       if (path === '/admin/delete' && request.method === 'POST') return await handleDelete(request, env);
+      if (path === '/admin/render-progress') return await handleRenderProgress(request, env);
       if (path.startsWith('/media/')) return await serveMedia(request, env, ctx, decodeURIComponent(path.slice('/media/'.length)));
       const rootSlugMatch = path.match(/^\/([^\/]+)$/);
       if (rootSlugMatch) return await renderPostPage(env, decodeURIComponent(rootSlugMatch[1]));
@@ -300,10 +301,21 @@ async function generateScenePrompts(topic, articleTitle, env) {
   }));
 }
 
-async function searchPixabayImage(query, env) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function searchPixabayImage(query, env, attempt = 0) {
   if (!env.PIXABAY_API_KEY) return null;
   try {
     const res = await fetch(`https://pixabay.com/api/?key=${env.PIXABAY_API_KEY}&q=${encodeURIComponent(query)}&image_type=photo&orientation=horizontal&per_page=3&safesearch=true`);
+    if (res.status === 429 && attempt < 2) {
+      await res.text().catch(() => {});
+      const backoffMs = 800 * (attempt + 1); // 레이트리밋이면 잠깐 쉬었다가 최대 2번 더 시도
+      console.log(`Pixabay 요청 제한("${query}"), ${backoffMs}ms 대기 후 재시도`);
+      await sleep(backoffMs);
+      return searchPixabayImage(query, env, attempt + 1);
+    }
     if (!res.ok) {
       await res.text().catch(() => {}); // body 미소비 시 "stalled response" 경고 발생 방지 (429 등 빈번함)
       console.log(`Pixabay 검색 실패("${query}"): HTTP ${res.status}`);
@@ -330,12 +342,19 @@ async function searchPixabayImage(query, env) {
   }
 }
 
-async function searchPexelsImage(query, env) {
+async function searchPexelsImage(query, env, attempt = 0) {
   if (!env.PEXELS_API_KEY) return null;
   try {
     const res = await fetch(`https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1&orientation=landscape`, {
       headers: { Authorization: env.PEXELS_API_KEY },
     });
+    if (res.status === 429 && attempt < 2) {
+      await res.text().catch(() => {});
+      const backoffMs = 800 * (attempt + 1);
+      console.log(`Pexels 요청 제한("${query}"), ${backoffMs}ms 대기 후 재시도`);
+      await sleep(backoffMs);
+      return searchPexelsImage(query, env, attempt + 1);
+    }
     if (!res.ok) {
       await res.text().catch(() => {}); // body 미소비 시 "stalled response" 경고 발생 방지
       console.log(`Pexels 검색 실패("${query}"): HTTP ${res.status}`);
@@ -807,6 +826,21 @@ function buildCaptionedImageSvg(imageBuffer, caption) {
   </svg>`;
 }
 
+// 동시성 제한된 map — 한꺼번에 다 병렬로 쏘면 Pixabay 초당 요청 제한(429)에 바로 걸림
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < items.length) {
+      const i = nextIndex++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
 async function generateAndSavePost(topic, env) {
   if (!env.POSTS) return { ok: false, reason: 'POSTS(KV) 바인딩 없음' };
 
@@ -844,7 +878,7 @@ async function generateAndSavePost(topic, env) {
   if (env.MEDIA) {
     // 이미지 소스는 저작권이 명확한 것만 사용: Pixabay/Pexels(무료 라이선스) → FLUX(직접 생성) 순서
     const scenes = await generateScenePrompts(topic, article.title, env);
-    const rawImages = (await Promise.all(scenes.map((s) => getSceneImage(s, topic, env)))).filter(Boolean);
+    const rawImages = (await mapWithConcurrency(scenes, 3, (s) => getSceneImage(s, topic, env))).filter(Boolean);
     console.log(`장면 원본 이미지 ${rawImages.length}/${scenes.length}개 확보`);
 
     // 내레이션 텍스트를 확보된 이미지 개수만큼 나눠서, 각 이미지 파일 안에 자막으로 직접 그려넣음(번인) — 웹 슬라이드쇼용.
@@ -1046,11 +1080,18 @@ async function renderAdminPage(env) {
     if (raw) posts.push(JSON.parse(raw));
   }
   const pendingVideoJobs = await env.POSTS.list({ prefix: 'videoJob:' });
-  const pendingSlugs = new Set(pendingVideoJobs.keys.map((k) => k.name.split(':')[1]));
+  const pendingVeoSlugs = new Set(pendingVideoJobs.keys.map((k) => k.name.split(':')[1]));
+  const pendingRenderJobs = await env.POSTS.list({ prefix: 'renderJob:' });
+  const pendingRenderSlugs = new Set(pendingRenderJobs.keys.map((k) => k.name.split(':')[1]));
 
   const rows = posts.map((p) => {
     const mediaStatus = `${p.images?.length ? `🖼️ ${p.images.length}장` : '이미지 없음'}${p.audio ? ' · 🔊 음성' : ''}${p.usedNews ? ' · 📰 뉴스참고' : ''}`;
-    const videoStatus = p.video ? '🎬 mp4 완료' : pendingSlugs.has(p.slug) ? '⏳ mp4 생성중' : '—';
+    const isRendering = pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug);
+    const videoStatus = p.video
+      ? '🎬 mp4 완료'
+      : isRendering
+        ? `<span class="render-progress" data-slug="${p.slug}">대기 중 · 0%</span>`
+        : '—';
     return `<tr>
       <td>${escapeHtml(p.title)}</td>
       <td class="mono">${escapeHtml(p.topic)}</td>
@@ -1062,6 +1103,33 @@ async function renderAdminPage(env) {
     </tr>`;
   }).join('');
 
+  const hasPending = posts.some((p) => !p.video && (pendingRenderSlugs.has(p.slug) || pendingVeoSlugs.has(p.slug)));
+  const progressScript = hasPending ? `<script>
+    (function(){
+      function poll(){
+        var els = document.querySelectorAll('.render-progress');
+        if (!els.length) return;
+        var pending = false;
+        els.forEach(function(el){
+          var slug = el.dataset.slug;
+          fetch('/admin/render-progress?slug=' + encodeURIComponent(slug))
+            .then(function(r){ return r.json(); })
+            .then(function(data){
+              if (data.status === 'done' || data.status === 'failed') {
+                location.reload();
+                return;
+              }
+              pending = true;
+              el.textContent = (data.stage || '진행 중') + ' · ' + (data.percent || 0) + '%';
+            })
+            .catch(function(){});
+        });
+      }
+      poll();
+      setInterval(poll, 3000);
+    })();
+  </script>` : '';
+
   const body = `${siteHeader()}<div class="wrap" style="padding:32px 0;">
     <h2>관리자 (총 ${idx.length}건)</h2>
     <p class="mono" style="color:var(--muted);font-size:12px;">생성은 동기 처리라 완료까지 페이지가 대기해요 (보통 몇십 초 내외).</p>
@@ -1071,9 +1139,40 @@ async function renderAdminPage(env) {
     </form>
     <table><thead><tr><th>제목</th><th>주제</th><th>미디어</th><th>mp4</th><th>작성일</th><th></th><th></th></tr></thead>
     <tbody>${rows || '<tr><td colspan="7">글이 없습니다.</td></tr>'}</tbody></table>
-  </div>`;
+  </div>${progressScript}`;
 
   return new Response(page('관리자 - life.news', body, { noindex: true }), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+async function handleRenderProgress(request, env) {
+  const url = new URL(request.url);
+  const slug = url.searchParams.get('slug');
+  if (!slug) return new Response(JSON.stringify({ error: 'slug 필요' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+
+  const jobRaw = await env.POSTS.get(`renderJob:${slug}`);
+  if (!jobRaw) {
+    // renderJob이 이미 없어졌다는 건 크론이 처리 완료(또는 정리)했다는 뜻 — post.video 유무로 결과 판단
+    const postRaw = await env.POSTS.get(`post:${slug}`);
+    const post = postRaw ? JSON.parse(postRaw) : null;
+    return new Response(JSON.stringify({ status: post?.video ? 'done' : 'failed', percent: post?.video ? 100 : 0 }), { headers: { 'Content-Type': 'application/json' } });
+  }
+  const job = JSON.parse(jobRaw);
+  if (!env.RELAY_URL || !env.RELAY_SECRET) {
+    return new Response(JSON.stringify({ status: 'processing', stage: '진행 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
+  }
+  try {
+    const res = await fetch(`${env.RELAY_URL}/render/status?jobId=${encodeURIComponent(job.jobId)}`, {
+      headers: { 'x-relay-secret': env.RELAY_SECRET },
+    });
+    if (!res.ok) {
+      await res.text().catch(() => {});
+      return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    const data = await res.json();
+    return new Response(JSON.stringify({ status: data.status, stage: data.stage, percent: data.percent }), { headers: { 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ status: 'processing', stage: '상태 확인 중', percent: 0 }), { headers: { 'Content-Type': 'application/json' } });
+  }
 }
 
 async function handleGenerate(request, env) {
