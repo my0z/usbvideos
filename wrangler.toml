@@ -1,3 +1,23 @@
-name = videos
-main = worker.js
-compatibility_date = 2026-01-01
+name = "videos"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[[kv_namespaces]]
+binding = "POSTS"
+id = "04fef6c7b29d43f8bde26e010bef1a29"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "usbkr-videos"
+
+[[r2_buckets]]
+binding = "VIDEOS"
+bucket_name = "usbkr-videos"
+
+[ai]
+binding = "AI"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+
