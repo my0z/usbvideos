@@ -3,7 +3,6 @@
  * Veo 대신 Workers AI의 이미지생성(FLUX)+음성합성(MeloTTS)만 사용 — 사실상 무료, 폴링 크론 불필요(동기 처리)
  */
 
-
 const CF_ACCOUNT_ID = '709dcc6af36c8ee7b6d3d99e7a9fe422';
 const VEO_MODEL = 'veo-3.1-fast-generate-preview';
 const VIDEO_JOB_TIMEOUT_MS = 30 * 60 * 1000; // 30분 넘게 안 끝나면 포기
@@ -482,61 +481,42 @@ async function fetchVeoVideoBytes(videoUri, videoBase64, env) {
   return await res.arrayBuffer();
 }
 
-const SHOTSTACK_API_BASE = 'https://api.shotstack.io/edit/stage'; // 안정화 확인 전까지 sandbox 유지, 이후 https://api.shotstack.io/edit/v1 로 전환
-const SITE_ORIGIN = 'https://videos.usb.kr'; // Shotstack이 외부에서 접근할 이미지/음성 URL의 기준 도메인
-const RENDER_IMAGE_DURATION_SEC = 4; // 이미지 한 장당 몇 초씩 보여줄지 (10장이면 총 40초 영상)
+const SITE_ORIGIN = 'https://videos.usb.kr'; // Oracle 릴레이가 외부에서 접근할 이미지/음성 URL의 기준 도메인
 
-async function startShotstackRender(rawImageKeys, audioKey, env) {
-  if (!env.SHOTSTACK_API_KEY) return { ok: false, error: 'SHOTSTACK_API_KEY 환경변수가 설정 안 됨' };
+// Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
+// 결과 mp4는 릴레이가 R2(usbkr-videos)에 바로 업로드하므로 Worker는 재다운로드할 필요 없음.
+async function startRelayRender(rawImageKeys, audioKey, outputKey, env) {
+  if (!env.RELAY_URL || !env.RELAY_SECRET) return { ok: false, error: 'RELAY_URL/RELAY_SECRET 환경변수가 설정 안 됨' };
   if (!rawImageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
 
   const imageUrls = rawImageKeys.map((k) => `${SITE_ORIGIN}/media/${k}`);
   const audioUrl = audioKey ? `${SITE_ORIGIN}/media/${audioKey}` : null;
 
-  const clips = imageUrls.map((src, i) => ({
-    asset: { type: 'image', src },
-    start: i * RENDER_IMAGE_DURATION_SEC,
-    length: RENDER_IMAGE_DURATION_SEC,
-    fit: 'cover',
-    transition: { in: 'fade', out: 'fade' },
-  }));
-
-  const timeline = {
-    tracks: [{ clips }],
-    ...(audioUrl ? { soundtrack: { src: audioUrl, effect: 'fadeOut' } } : {}),
-  };
-
-  const body = {
-    timeline,
-    output: { format: 'mp4', resolution: 'hd' },
-  };
-
   try {
-    const res = await fetch(`${SHOTSTACK_API_BASE}/render`, {
+    const res = await fetch(`${env.RELAY_URL}/render`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': env.SHOTSTACK_API_KEY },
-      body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json', 'x-relay-secret': env.RELAY_SECRET },
+      body: JSON.stringify({ images: imageUrls, audioUrl, outputKey }),
     });
     if (!res.ok) {
       const bodyText = await res.text();
-      return { ok: false, error: `Shotstack 작업 생성 실패: HTTP ${res.status} — ${bodyText.slice(0, 400)}` };
+      return { ok: false, error: `릴레이 렌더링 요청 실패: HTTP ${res.status} — ${bodyText.slice(0, 400)}` };
     }
     const data = await res.json();
-    const jobId = data?.response?.id;
-    if (!jobId) return { ok: false, error: `Shotstack 응답에 작업 ID 없음 — raw: ${JSON.stringify(data).slice(0, 400)}` };
-    return { ok: true, jobId };
+    if (!data?.jobId) return { ok: false, error: `릴레이 응답에 jobId 없음 — raw: ${JSON.stringify(data).slice(0, 400)}` };
+    return { ok: true, jobId: data.jobId };
   } catch (e) {
-    return { ok: false, error: `Shotstack 요청 오류: ${e.message}` };
+    return { ok: false, error: `릴레이 요청 오류: ${e.message}` };
   }
 }
 
 async function pollPendingRenderJobs(env) {
   const list = await env.POSTS.list({ prefix: 'renderJob:' });
   if (!list.keys.length) {
-    console.log('대기 중인 Shotstack 렌더링 작업 없음.');
+    console.log('대기 중인 릴레이 렌더링 작업 없음.');
     return;
   }
-  console.log(`대기 중인 Shotstack 렌더링 작업 ${list.keys.length}건 확인.`);
+  console.log(`대기 중인 릴레이 렌더링 작업 ${list.keys.length}건 확인.`);
 
   for (const keyInfo of list.keys) {
     const rawJob = await env.POSTS.get(keyInfo.name);
@@ -545,21 +525,21 @@ async function pollPendingRenderJobs(env) {
 
     let res;
     try {
-      res = await fetch(`${SHOTSTACK_API_BASE}/render/${job.jobId}`, {
-        headers: { 'x-api-key': env.SHOTSTACK_API_KEY },
+      res = await fetch(`${env.RELAY_URL}/render/status?jobId=${encodeURIComponent(job.jobId)}`, {
+        headers: { 'x-relay-secret': env.RELAY_SECRET },
       });
     } catch (e) {
-      console.log(`[${keyInfo.name}] Shotstack 상태 조회 네트워크 오류: ${e.message}`);
+      console.log(`[${keyInfo.name}] 릴레이 상태 조회 네트워크 오류: ${e.message}`);
       continue;
     }
     if (!res.ok) {
       const bodyText = await res.text();
-      console.log(`[${keyInfo.name}] Shotstack 상태 조회 실패 HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
+      console.log(`[${keyInfo.name}] 릴레이 상태 조회 실패 HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
       continue;
     }
 
     const data = await res.json();
-    const status = data?.response?.status; // queued | fetching | rendering | saving | done | failed
+    const status = data?.status; // processing | done | failed
     const isDone = status === 'done';
     const isFailed = status === 'failed';
 
@@ -574,30 +554,12 @@ async function pollPendingRenderJobs(env) {
     }
 
     if (isFailed) {
-      console.log(`[${keyInfo.name}] Shotstack 렌더링 실패 — raw: ${JSON.stringify(data).slice(0, 400)}`);
+      console.log(`[${keyInfo.name}] 릴레이 렌더링 실패 — ${data?.error || '알 수 없는 오류'}`);
       await env.POSTS.delete(keyInfo.name);
       continue;
     }
 
-    const outputUrl = data?.response?.url;
-    if (!outputUrl) {
-      console.log(`[${keyInfo.name}] 완료됐지만 결과 URL을 못 찾음 — raw: ${JSON.stringify(data).slice(0, 400)}`);
-      await env.POSTS.delete(keyInfo.name);
-      continue;
-    }
-
-    let videoBuffer;
-    try {
-      const videoRes = await fetch(outputUrl);
-      if (!videoRes.ok) throw new Error(`HTTP ${videoRes.status}`);
-      videoBuffer = await videoRes.arrayBuffer();
-    } catch (e) {
-      console.log(`[${keyInfo.name}] 결과 mp4 다운로드 실패: ${e.message}`);
-      continue;
-    }
-
-    await env.MEDIA.put(job.r2Key, videoBuffer, { httpMetadata: { contentType: 'video/mp4' } });
-
+    // 릴레이가 이미 R2(env.MEDIA와 동일 버킷)에 mp4를 직접 업로드해둔 상태 — 재다운로드/재업로드 불필요
     const postRaw = await env.POSTS.get(`post:${job.slug}`);
     if (postRaw) {
       const post = JSON.parse(postRaw);
@@ -605,7 +567,7 @@ async function pollPendingRenderJobs(env) {
       await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
     }
     await env.POSTS.delete(keyInfo.name);
-    console.log(`[${keyInfo.name}] Shotstack 렌더링 완료 및 저장: ${job.r2Key}`);
+    console.log(`[${keyInfo.name}] 릴레이 렌더링 완료 및 저장: ${job.r2Key}`);
   }
 }
 
@@ -830,16 +792,17 @@ async function generateAndSavePost(topic, env) {
   idx.unshift(slug);
   await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
 
-  // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Shotstack으로 합성. 기다리지 않고 등록만.
-  if (env.SHOTSTACK_API_KEY && env.MEDIA && rawImageKeys.length) {
-    const render = await startShotstackRender(rawImageKeys, audioKey, env);
+  // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Oracle 릴레이(ffmpeg)로 합성. 기다리지 않고 등록만.
+  if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && rawImageKeys.length) {
+    const outputKey = `${slug}.mp4`;
+    const render = await startRelayRender(rawImageKeys, audioKey, outputKey, env);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
-        jobId: render.jobId, slug, r2Key: `${slug}.mp4`, startedAt: Date.now(),
+        jobId: render.jobId, slug, r2Key: outputKey, startedAt: Date.now(),
       }));
-      console.log(`Shotstack 렌더링 작업 등록됨: ${slug} (jobId: ${render.jobId})`);
+      console.log(`릴레이 렌더링 작업 등록됨: ${slug} (jobId: ${render.jobId})`);
     } else {
-      console.log(`Shotstack 렌더링 작업 시작 실패(글 발행은 계속 진행): ${render.error}`);
+      console.log(`릴레이 렌더링 작업 시작 실패(글 발행은 계속 진행): ${render.error}`);
     }
   }
 
