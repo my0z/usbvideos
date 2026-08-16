@@ -1,6 +1,7 @@
 name = "videos"
 main = "worker.js"
 compatibility_date = "2026-01-01"
+keep_vars = true
 
 [[kv_namespaces]]
 binding = "POSTS"
@@ -34,5 +35,3 @@ invocation_logs = true
 enabled = true
 persist = true
 head_sampling_rate = 1
-
-
