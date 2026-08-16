@@ -512,7 +512,7 @@ const SITE_ORIGIN = 'https://videos.usb.kr'; // Oracle 릴레이가 외부에서
 
 // Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
 // 결과 mp4는 릴레이가 R2(usbkr-videos)에 바로 업로드하므로 Worker는 재다운로드할 필요 없음.
-async function startRelayRender(rawImageKeys, audioKey, outputKey, env) {
+async function startRelayRender(rawImageKeys, audioKey, outputKey, weights, env) {
   if (!env.RELAY_URL || !env.RELAY_SECRET) return { ok: false, error: 'RELAY_URL/RELAY_SECRET 환경변수가 설정 안 됨' };
   if (!rawImageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
 
@@ -523,7 +523,9 @@ async function startRelayRender(rawImageKeys, audioKey, outputKey, env) {
     const res = await fetch(`${env.RELAY_URL}/render`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-relay-secret': env.RELAY_SECRET },
-      body: JSON.stringify({ images: imageUrls, audioUrl, outputKey }),
+      // weights: 이미지별 자막 글자수 비율 — 릴레이가 오디오 실제 길이(ffprobe)에 이 비율을 곱해서
+      // 이미지마다 노출시간을 다르게 줌(= 자막 분량과 화면 전환 속도가 나레이션과 어긋나지 않게)
+      body: JSON.stringify({ images: imageUrls, audioUrl, outputKey, weights }),
     });
     if (!res.ok) {
       const bodyText = await res.text();
@@ -706,19 +708,40 @@ function arrayBufferToBase64(buffer) {
   return btoa(binary);
 }
 
+// 문장을 N개 구간으로 나누되, 문장 "개수"가 아니라 "글자수"가 균등해지도록 배분 —
+// 이래야 각 이미지에 배정된 자막 분량이 실제 발화 시간과 비례해서, 나레이션 속도와 슬라이드 전환이 맞아떨어짐.
 function splitTextIntoNChunks(text, n) {
   const sentences = (text || '').split(/(?<=[.!?。！？])\s+/).filter(Boolean);
   if (n <= 0) return [];
-  if (!sentences.length) return Array(n).fill('');
-  const perChunk = Math.ceil(sentences.length / n);
+  if (!sentences.length) return Array.from({ length: n }, () => ({ text: '', weight: 1 / n }));
+
+  const totalChars = sentences.reduce((sum, s) => sum + s.length, 0) || 1;
+  const target = totalChars / n;
   const chunks = [];
-  for (let i = 0; i < n; i++) {
-    chunks.push(sentences.slice(i * perChunk, (i + 1) * perChunk).join(' ').trim());
+  let current = [];
+  let currentLen = 0;
+  for (const sentence of sentences) {
+    current.push(sentence);
+    currentLen += sentence.length;
+    if (currentLen >= target && chunks.length < n - 1) {
+      chunks.push(current.join(' ').trim());
+      current = [];
+      currentLen = 0;
+    }
   }
-  return chunks;
+  if (current.length) chunks.push(current.join(' ').trim());
+  while (chunks.length < n) chunks.push('');
+  if (chunks.length > n) {
+    const overflow = chunks.splice(n - 1).join(' ').trim();
+    chunks.push(overflow);
+  }
+
+  const rawWeights = chunks.map((c) => Math.max(c.length, 1)); // 빈 칸도 최소 노출시간은 보장
+  const sumWeights = rawWeights.reduce((a, b) => a + b, 0) || 1;
+  return chunks.map((text, i) => ({ text, weight: rawWeights[i] / sumWeights }));
 }
 
-function wrapCaptionLines(text, maxCharsPerLine = 28, maxLines = 3) {
+function wrapCaptionLines(text, maxCharsPerLine = 26, maxLines = 3) {
   const words = (text || '').split(/\s+/).filter(Boolean);
   const lines = [];
   let current = '';
@@ -736,17 +759,38 @@ function wrapCaptionLines(text, maxCharsPerLine = 28, maxLines = 3) {
   return lines.slice(0, maxLines);
 }
 
+// 자막 스타일: 평평한 검은 띠 대신 아래에서 위로 옅어지는 그라데이션 스크림 + 굵은 흰 글자에
+// 검은 외곽선(paint-order stroke)을 둘러서, 어떤 배경 사진 위에서도 가독성이 확보되도록 함.
 function buildCaptionedImageSvg(imageBuffer, caption) {
   const width = 1280;
   const height = 720;
   const dataUri = `data:image/jpeg;base64,${arrayBufferToBase64(imageBuffer)}`;
-  const lines = wrapCaptionLines(caption, 30, 3);
-  const lineHeight = 44;
-  const bandHeight = lines.length ? lines.length * lineHeight + 44 : 0;
-  const tspans = lines.map((line, i) => `<tspan x="${width / 2}" dy="${i === 0 ? 0 : lineHeight}">${escapeXml(line)}</tspan>`).join('');
+  const lines = wrapCaptionLines(caption, 26, 3);
+  const fontSize = 38;
+  const lineHeight = 50;
+  const bottomPadding = 56;
+  const textBlockHeight = lines.length * lineHeight;
+  const scrimHeight = lines.length ? textBlockHeight + bottomPadding + 40 : 0;
+  const firstLineY = height - bottomPadding - (lines.length - 1) * lineHeight;
+  const tspans = lines
+    .map((line, i) => `<tspan x="${width / 2}" y="${firstLineY + i * lineHeight}">${escapeXml(line)}</tspan>`)
+    .join('');
   const captionMarkup = lines.length
-    ? `<rect x="0" y="${height - bandHeight}" width="${width}" height="${bandHeight}" fill="black" fill-opacity="0.68"/>
-       <text x="${width / 2}" y="${height - bandHeight + 40}" font-family="sans-serif" font-size="34" font-weight="600" fill="white" text-anchor="middle">${tspans}</text>`
+    ? `<defs>
+         <linearGradient id="capScrim" x1="0" y1="0" x2="0" y2="1">
+           <stop offset="0%" stop-color="#000000" stop-opacity="0"/>
+           <stop offset="55%" stop-color="#000000" stop-opacity="0.55"/>
+           <stop offset="100%" stop-color="#000000" stop-opacity="0.82"/>
+         </linearGradient>
+       </defs>
+       <rect x="0" y="${height - scrimHeight}" width="${width}" height="${scrimHeight}" fill="url(#capScrim)"/>
+       <text
+         font-family="'Noto Sans KR','Apple SD Gothic Neo','Malgun Gothic',sans-serif"
+         font-size="${fontSize}" font-weight="700" text-anchor="middle"
+         letter-spacing="0.2"
+         paint-order="stroke fill" stroke="rgba(0,0,0,0.85)" stroke-width="7" stroke-linejoin="round"
+         fill="#ffffff"
+       >${tspans}</text>`
     : '';
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
     <image href="${dataUri}" x="0" y="0" width="${width}" height="${height}" preserveAspectRatio="xMidYMid slice"/>
@@ -786,19 +830,24 @@ async function generateAndSavePost(topic, env) {
 
   let images = [];
   let rawImageKeys = [];
+  let captionWeights = [];
   if (env.MEDIA) {
     // 이미지 소스는 저작권이 명확한 것만 사용: Pixabay/Pexels(무료 라이선스) → FLUX(직접 생성) 순서
     const scenes = await generateScenePrompts(topic, article.title, env);
     const rawImages = (await Promise.all(scenes.map((s) => getSceneImage(s, topic, env)))).filter(Boolean);
     console.log(`장면 원본 이미지 ${rawImages.length}/${scenes.length}개 확보`);
 
-    // 내레이션 텍스트를 확보된 이미지 개수만큼 나눠서, 각 이미지 파일 안에 자막으로 직접 그려넣음(번인) — 웹 슬라이드쇼용
+    // 내레이션 텍스트를 확보된 이미지 개수만큼 나눠서, 각 이미지 파일 안에 자막으로 직접 그려넣음(번인) — 웹 슬라이드쇼용.
+    // 글자수 비례로 나눈 chunk의 weight를 그대로 저장해뒀다가, 웹 슬라이드쇼 전환 속도/mp4 렌더링 이미지 노출시간에
+    // 동일하게 적용해서 자막 분량과 실제 노출시간이 항상 비례하도록 함(= 나레이션 속도와 자막 싱크).
     const perImageCaptions = splitTextIntoNChunks(narrationText, rawImages.length || 1);
     for (let i = 0; i < rawImages.length; i++) {
-      const svg = buildCaptionedImageSvg(rawImages[i], perImageCaptions[i] || '');
+      const chunk = perImageCaptions[i] || { text: '', weight: 1 / (rawImages.length || 1) };
+      const svg = buildCaptionedImageSvg(rawImages[i], chunk.text);
       const key = `${slug}-scene-${i}.svg`;
       await env.MEDIA.put(key, svg, { httpMetadata: { contentType: 'image/svg+xml' } });
       images.push(key);
+      captionWeights.push(chunk.weight);
 
       // ffmpeg가 안정적으로 읽을 수 있게 자막 없는 순수 JPEG 원본도 별도 저장 (mp4 렌더링 전용)
       const rawKey = `${slug}-raw-${i}.jpg`;
@@ -811,7 +860,7 @@ async function generateAndSavePost(topic, env) {
   const post = {
     slug, topic, title: article.title, createdAt: new Date().toISOString(),
     intro: article.intro_html, sections: article.sections || [], outro: article.outro_html,
-    images, audio: audioKey, usedNews,
+    images, audio: audioKey, usedNews, captionWeights,
   };
   await env.POSTS.put(`post:${slug}`, JSON.stringify(post));
   const idxRaw = await env.POSTS.get('index');
@@ -822,7 +871,7 @@ async function generateAndSavePost(topic, env) {
   // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Oracle 릴레이(ffmpeg)로 합성. 기다리지 않고 등록만.
   if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && rawImageKeys.length) {
     const outputKey = `${slug}.mp4`;
-    const render = await startRelayRender(rawImageKeys, audioKey, outputKey, env);
+    const render = await startRelayRender(rawImageKeys, audioKey, outputKey, captionWeights, env);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
         jobId: render.jobId, slug, r2Key: outputKey, startedAt: Date.now(),
@@ -844,18 +893,35 @@ function renderSlideshow(post) {
   const audioTag = hasAudio ? `<audio id="narration-${post.slug}" src="/media/${post.audio}" preload="auto"></audio>` : '';
   // 자동재생이 브라우저 정책으로 막혔을 때만 노출되는 최소 대체 버튼 (평소엔 숨김)
   const fallbackBtn = hasAudio ? `<button class="playbtn" id="playbtn-${post.slug}" style="display:none;">🔇 소리 켜기</button>` : '';
+  const weightsJson = JSON.stringify(Array.isArray(post.captionWeights) ? post.captionWeights : []);
   const script = `<script>
     (function(){
       var root = document.getElementById('slideshow-${post.slug}');
       var slides = root.querySelectorAll('.slide');
-      var current = 0, timer = null;
-      var DEFAULT_INTERVAL = 6000;
+      var weights = ${weightsJson};
+      var current = 0, timerId = null;
+      var DEFAULT_MS = 6000;
       function show(i){ slides.forEach(function(s,idx){ s.classList.toggle('active', idx===i); }); }
-      function startCycle(intervalMs){
-        clearInterval(timer);
-        timer = setInterval(function(){ current = (current+1) % slides.length; show(current); }, intervalMs);
+      // 자막 글자수 비율(weights)이 있으면 그 비율대로, 없으면 균등 분배 — 어느 쪽이든 합은 totalMs
+      function durationsFor(totalMs){
+        if (weights.length === slides.length && slides.length) {
+          var sum = weights.reduce(function(a,b){ return a+b; }, 0) || 1;
+          return weights.map(function(w){ return Math.max(1500, (w/sum)*totalMs); });
+        }
+        return slides.length ? Array.from({length:slides.length}, function(){ return totalMs/slides.length; }) : [];
       }
-      startCycle(DEFAULT_INTERVAL);
+      var currentDurations = durationsFor(DEFAULT_MS * slides.length);
+      function scheduleNext(){
+        clearTimeout(timerId);
+        if (!slides.length) return;
+        var d = currentDurations[current] || DEFAULT_MS;
+        timerId = setTimeout(function(){
+          current = (current + 1) % slides.length;
+          show(current);
+          scheduleNext();
+        }, d);
+      }
+      scheduleNext();
       ${hasAudio ? `
       var audio = document.getElementById('narration-${post.slug}');
       var btn = document.getElementById('playbtn-${post.slug}');
@@ -874,14 +940,15 @@ function renderSlideshow(post) {
         btn.style.display = 'none';
       });
       audio.addEventListener('loadedmetadata', function(){
-        var per = Math.max(4000, (audio.duration / slides.length) * 1000);
-        startCycle(per); // 음성 길이를 알면 이미지(=자막) 전환 속도를 여기에 맞춰 재조정
+        // 실제 음성 길이를 알면 그 길이 기준으로 각 이미지 노출시간을 자막 비율대로 재계산 (나레이션과 싱크)
+        currentDurations = durationsFor(Math.max(4000 * slides.length, audio.duration * 1000));
       });
       audio.addEventListener('play', function(){
         btn.style.display = 'none';
       });
       audio.addEventListener('ended', function(){
-        startCycle(DEFAULT_INTERVAL); show(0);
+        currentDurations = durationsFor(DEFAULT_MS * slides.length);
+        current = 0; show(0); scheduleNext();
       });
       ` : ''}
     })();
