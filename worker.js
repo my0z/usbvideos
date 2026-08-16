@@ -621,8 +621,20 @@ async function pollPendingRenderJobs(env) {
     if (postRaw) {
       const post = JSON.parse(postRaw);
       post.video = job.r2Key;
+
+      // mp4가 완성되면 SVG 이미지·mp3는 더 이상 필요 없음(웹 화면도 이제 mp4 하나만 보여줌) — 전부 삭제하고 mp4만 남김
+      const toDelete = [...(post.images || []), ...(job.rawImageKeys || [])];
+      if (post.audio) toDelete.push(post.audio);
+      if (toDelete.length) {
+        await Promise.all(toDelete.map((k) => env.MEDIA.delete(k).catch(() => {})));
+        console.log(`[${keyInfo.name}] SVG/mp3/원본jpg ${toDelete.length}개 정리 완료 — mp4만 남김`);
+      }
+      post.images = [];
+      post.audio = null;
+
       await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
     }
+
     await env.POSTS.delete(keyInfo.name);
     console.log(`[${keyInfo.name}] 릴레이 렌더링 완료 및 저장: ${job.r2Key}`);
   }
@@ -920,7 +932,7 @@ async function generateAndSavePost(topic, env) {
     const render = await startRelayRender(rawImageKeys, audioKey, outputKey, captionWeights, captionTexts, env);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
-        jobId: render.jobId, slug, r2Key: outputKey, startedAt: Date.now(),
+        jobId: render.jobId, slug, r2Key: outputKey, rawImageKeys, startedAt: Date.now(),
       }));
       console.log(`릴레이 렌더링 작업 등록됨: ${slug} (jobId: ${render.jobId})`);
     } else {
@@ -1042,7 +1054,8 @@ async function renderPostPage(env, slug) {
   const p = JSON.parse(raw);
 
   const sectionsHtml = (p.sections || []).map((s) => `<h2>${escapeHtml(s.heading)}</h2>${s.body_html}`).join('');
-  const slideshow = renderSlideshow(p);
+  // mp4가 완성된 글은 SVG/mp3가 이미 삭제된 상태라 슬라이드쇼를 그리면 깨진 이미지만 남음 — 영상 하나만 보여줌
+  const slideshow = p.video ? '' : renderSlideshow(p);
   const veoVideoBlock = p.video
     ? `<div style="margin:20px 0;">
         <video controls preload="metadata" style="width:100%;border-radius:10px;background:#000;" src="/media/${p.video}"></video>
