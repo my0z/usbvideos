@@ -481,57 +481,61 @@ async function fetchVeoVideoBytes(videoUri, videoBase64, env) {
   return await res.arrayBuffer();
 }
 
-const RENDOBAR_API_BASE = 'https://api.rendobar.com';
-const SITE_ORIGIN = 'https://videos.usb.kr'; // Rendobar가 외부에서 접근할 이미지/음성 URL의 기준 도메인
+const SHOTSTACK_API_BASE = 'https://api.shotstack.io/edit/stage'; // 안정화 확인 전까지 sandbox 유지, 이후 https://api.shotstack.io/edit/v1 로 전환
+const SITE_ORIGIN = 'https://videos.usb.kr'; // Shotstack이 외부에서 접근할 이미지/음성 URL의 기준 도메인
 const RENDER_IMAGE_DURATION_SEC = 4; // 이미지 한 장당 몇 초씩 보여줄지 (10장이면 총 40초 영상)
 
-// Rendobar 응답이 { data: {...} } 로 한 겹 감싸져 오는 경우와, 감싸지지 않고 바로 오는 경우를 둘 다 처리
-function unwrapRendobarPayload(data) {
-  return data && typeof data === 'object' && data.data && typeof data.data === 'object' ? data.data : data;
-}
-
-async function startRendobarRender(rawImageKeys, audioKey, outputKey, env) {
-  if (!env.RENDOBAR_API_KEY) return { ok: false, error: 'RENDOBAR_API_KEY 환경변수가 설정 안 됨' };
+async function startShotstackRender(rawImageKeys, audioKey, env) {
+  if (!env.SHOTSTACK_API_KEY) return { ok: false, error: 'SHOTSTACK_API_KEY 환경변수가 설정 안 됨' };
   if (!rawImageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
 
   const imageUrls = rawImageKeys.map((k) => `${SITE_ORIGIN}/media/${k}`);
   const audioUrl = audioKey ? `${SITE_ORIGIN}/media/${audioKey}` : null;
 
-  // 이미지 여러 장을 순서대로 이어붙이고, 있으면 오디오까지 씌우는 ffmpeg 명령 구성
-  const inputArgs = imageUrls.map((u) => `-loop 1 -t ${RENDER_IMAGE_DURATION_SEC} -i "${u}"`).join(' ');
-  const filterInputs = imageUrls.map((_, i) => `[${i}:v]scale=1280:720,setsar=1[v${i}]`).join(';');
-  const concatInputs = imageUrls.map((_, i) => `[v${i}]`).join('');
-  const filterComplex = `${filterInputs};${concatInputs}concat=n=${imageUrls.length}:v=1:a=0[outv]`;
-  const audioArgs = audioUrl ? `-i "${audioUrl}" -map "[outv]" -map ${imageUrls.length}:a -c:a aac -shortest` : `-map "[outv]" -an`;
-  const command = `ffmpeg -y ${inputArgs} ${audioUrl ? `-i "${audioUrl}"` : ''} -filter_complex "${filterComplex}" ${audioArgs} -c:v libx264 -pix_fmt yuv420p output.mp4`;
+  const clips = imageUrls.map((src, i) => ({
+    asset: { type: 'image', src },
+    start: i * RENDER_IMAGE_DURATION_SEC,
+    length: RENDER_IMAGE_DURATION_SEC,
+    fit: 'cover',
+    transition: { in: 'fade', out: 'fade' },
+  }));
+
+  const timeline = {
+    tracks: [{ clips }],
+    ...(audioUrl ? { soundtrack: { src: audioUrl, effect: 'fadeOut' } } : {}),
+  };
+
+  const body = {
+    timeline,
+    output: { format: 'mp4', resolution: 'hd' },
+  };
 
   try {
-    const res = await fetch(`${RENDOBAR_API_BASE}/jobs`, {
+    const res = await fetch(`${SHOTSTACK_API_BASE}/render`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${env.RENDOBAR_API_KEY}` },
-      body: JSON.stringify({ type: 'ffmpeg', params: { command } }),
+      headers: { 'Content-Type': 'application/json', 'x-api-key': env.SHOTSTACK_API_KEY },
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       const bodyText = await res.text();
-      return { ok: false, error: `Rendobar 작업 생성 실패: HTTP ${res.status} — ${bodyText.slice(0, 400)}` };
+      return { ok: false, error: `Shotstack 작업 생성 실패: HTTP ${res.status} — ${bodyText.slice(0, 400)}` };
     }
-    const raw = await res.json();
-    const payload = unwrapRendobarPayload(raw); // 실제 응답이 {"data":{"id":"job_..","status":"waiting"}} 형태라 한 겹 벗겨냄
-    const jobId = payload?.id || payload?.jobId || payload?.job?.id;
-    if (!jobId) return { ok: false, error: `Rendobar 응답에 작업 ID 없음 — raw: ${JSON.stringify(raw).slice(0, 400)}` };
+    const data = await res.json();
+    const jobId = data?.response?.id;
+    if (!jobId) return { ok: false, error: `Shotstack 응답에 작업 ID 없음 — raw: ${JSON.stringify(data).slice(0, 400)}` };
     return { ok: true, jobId };
   } catch (e) {
-    return { ok: false, error: `Rendobar 요청 오류: ${e.message}` };
+    return { ok: false, error: `Shotstack 요청 오류: ${e.message}` };
   }
 }
 
 async function pollPendingRenderJobs(env) {
   const list = await env.POSTS.list({ prefix: 'renderJob:' });
   if (!list.keys.length) {
-    console.log('대기 중인 Rendobar 렌더링 작업 없음.');
+    console.log('대기 중인 Shotstack 렌더링 작업 없음.');
     return;
   }
-  console.log(`대기 중인 Rendobar 렌더링 작업 ${list.keys.length}건 확인.`);
+  console.log(`대기 중인 Shotstack 렌더링 작업 ${list.keys.length}건 확인.`);
 
   for (const keyInfo of list.keys) {
     const rawJob = await env.POSTS.get(keyInfo.name);
@@ -540,28 +544,27 @@ async function pollPendingRenderJobs(env) {
 
     let res;
     try {
-      res = await fetch(`${RENDOBAR_API_BASE}/jobs/${job.jobId}`, {
-        headers: { Authorization: `Bearer ${env.RENDOBAR_API_KEY}` },
+      res = await fetch(`${SHOTSTACK_API_BASE}/render/${job.jobId}`, {
+        headers: { 'x-api-key': env.SHOTSTACK_API_KEY },
       });
     } catch (e) {
-      console.log(`[${keyInfo.name}] Rendobar 상태 조회 네트워크 오류: ${e.message}`);
+      console.log(`[${keyInfo.name}] Shotstack 상태 조회 네트워크 오류: ${e.message}`);
       continue;
     }
     if (!res.ok) {
       const bodyText = await res.text();
-      console.log(`[${keyInfo.name}] Rendobar 상태 조회 실패 HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
+      console.log(`[${keyInfo.name}] Shotstack 상태 조회 실패 HTTP ${res.status}: ${bodyText.slice(0, 300)}`);
       continue;
     }
 
-    const raw = await res.json();
-    const data = unwrapRendobarPayload(raw); // 상태 조회 응답도 {"data":{...}} 로 감싸져 올 수 있어 동일하게 처리
-    const status = data?.status || data?.state;
-    const isDone = status === 'complete' || status === 'completed' || status === 'succeeded' || status === 'done' || data?.done === true;
-    const isFailed = status === 'failed' || status === 'error';
+    const data = await res.json();
+    const status = data?.response?.status; // queued | fetching | rendering | saving | done | failed
+    const isDone = status === 'done';
+    const isFailed = status === 'failed';
 
     if (!isDone && !isFailed) {
       if (Date.now() - job.startedAt > VIDEO_JOB_TIMEOUT_MS) {
-        console.log(`[${keyInfo.name}] 타임아웃, 정리함. 마지막 상태: ${JSON.stringify(raw).slice(0, 300)}`);
+        console.log(`[${keyInfo.name}] 타임아웃, 정리함. 마지막 상태: ${JSON.stringify(data).slice(0, 300)}`);
         await env.POSTS.delete(keyInfo.name);
       } else {
         console.log(`[${keyInfo.name}] 아직 진행 중 (상태: ${status || '알 수 없음'})`);
@@ -570,14 +573,14 @@ async function pollPendingRenderJobs(env) {
     }
 
     if (isFailed) {
-      console.log(`[${keyInfo.name}] Rendobar 렌더링 실패 — raw: ${JSON.stringify(raw).slice(0, 400)}`);
+      console.log(`[${keyInfo.name}] Shotstack 렌더링 실패 — raw: ${JSON.stringify(data).slice(0, 400)}`);
       await env.POSTS.delete(keyInfo.name);
       continue;
     }
 
-    const outputUrl = data?.output?.url || data?.outputUrl || data?.result?.url || data?.url;
+    const outputUrl = data?.response?.url;
     if (!outputUrl) {
-      console.log(`[${keyInfo.name}] 완료됐지만 결과 URL을 못 찾음 — raw: ${JSON.stringify(raw).slice(0, 400)}`);
+      console.log(`[${keyInfo.name}] 완료됐지만 결과 URL을 못 찾음 — raw: ${JSON.stringify(data).slice(0, 400)}`);
       await env.POSTS.delete(keyInfo.name);
       continue;
     }
@@ -601,7 +604,7 @@ async function pollPendingRenderJobs(env) {
       await env.POSTS.put(`post:${job.slug}`, JSON.stringify(post));
     }
     await env.POSTS.delete(keyInfo.name);
-    console.log(`[${keyInfo.name}] Rendobar 렌더링 완료 및 저장: ${job.r2Key}`);
+    console.log(`[${keyInfo.name}] Shotstack 렌더링 완료 및 저장: ${job.r2Key}`);
   }
 }
 
@@ -826,16 +829,16 @@ async function generateAndSavePost(topic, env) {
   idx.unshift(slug);
   await env.POSTS.put('index', JSON.stringify(idx.slice(0, 500)));
 
-  // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Rendobar(ffmpeg 대행)로 합성. 기다리지 않고 등록만.
-  if (env.RENDOBAR_API_KEY && env.MEDIA && rawImageKeys.length) {
-    const render = await startRendobarRender(rawImageKeys, audioKey, `${slug}.mp4`, env);
+  // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Shotstack으로 합성. 기다리지 않고 등록만.
+  if (env.SHOTSTACK_API_KEY && env.MEDIA && rawImageKeys.length) {
+    const render = await startShotstackRender(rawImageKeys, audioKey, env);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
         jobId: render.jobId, slug, r2Key: `${slug}.mp4`, startedAt: Date.now(),
       }));
-      console.log(`Rendobar 렌더링 작업 등록됨: ${slug} (jobId: ${render.jobId})`);
+      console.log(`Shotstack 렌더링 작업 등록됨: ${slug} (jobId: ${render.jobId})`);
     } else {
-      console.log(`Rendobar 렌더링 작업 시작 실패(글 발행은 계속 진행): ${render.error}`);
+      console.log(`Shotstack 렌더링 작업 시작 실패(글 발행은 계속 진행): ${render.error}`);
     }
   }
 
