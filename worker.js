@@ -56,7 +56,8 @@ const STYLE = `
   .slideshow{ position:relative; aspect-ratio:16/9; background:#000; border-radius:10px; overflow:hidden; margin:20px 0; }
   .slideshow .slide{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; opacity:0; transition:opacity 0.8s ease; }
   .slideshow .slide.active{ opacity:1; }
-  .slideshow .playbtn{ position:absolute; bottom:14px; right:14px; z-index:5; }
+  .slideshow .playbtn{ position:absolute; bottom:14px; right:14px; z-index:5; background:rgba(0,0,0,0.6); color:#fff; border:1px solid rgba(255,255,255,0.4); padding:8px 16px; border-radius:20px; font-size:13px; font-weight:600; cursor:pointer; backdrop-filter:blur(4px); }
+  .slideshow .playbtn:hover{ background:rgba(0,0,0,0.8); }
 `;
 
 const FONTS = `<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,400;9..144,500&display=swap" rel="stylesheet">`;
@@ -240,6 +241,7 @@ async function searchNaverNews(topic, env) {
       },
     });
     if (!res.ok) {
+      await res.text().catch(() => {}); // body 미소비 시 "stalled response" 경고 발생 방지
       console.log(`네이버 뉴스검색 실패: HTTP ${res.status}`);
       return [];
     }
@@ -303,6 +305,7 @@ async function searchPixabayImage(query, env) {
   try {
     const res = await fetch(`https://pixabay.com/api/?key=${env.PIXABAY_API_KEY}&q=${encodeURIComponent(query)}&image_type=photo&orientation=horizontal&per_page=3&safesearch=true`);
     if (!res.ok) {
+      await res.text().catch(() => {}); // body 미소비 시 "stalled response" 경고 발생 방지 (429 등 빈번함)
       console.log(`Pixabay 검색 실패("${query}"): HTTP ${res.status}`);
       return null;
     }
@@ -311,7 +314,10 @@ async function searchPixabayImage(query, env) {
     const imageUrl = hit?.largeImageURL || hit?.webformatURL;
     if (!imageUrl) return null;
     const imgRes = await fetch(imageUrl);
-    if (!imgRes.ok) return null;
+    if (!imgRes.ok) {
+      await imgRes.text().catch(() => {});
+      return null;
+    }
     const buffer = await imgRes.arrayBuffer();
     if (!isUsableImage(buffer)) {
       console.log(`Pixabay 이미지가 너무 작아(용량 기준) 못 씀("${query}"): ${buffer.byteLength}바이트`);
@@ -331,6 +337,7 @@ async function searchPexelsImage(query, env) {
       headers: { Authorization: env.PEXELS_API_KEY },
     });
     if (!res.ok) {
+      await res.text().catch(() => {}); // body 미소비 시 "stalled response" 경고 발생 방지
       console.log(`Pexels 검색 실패("${query}"): HTTP ${res.status}`);
       return null;
     }
@@ -339,7 +346,10 @@ async function searchPexelsImage(query, env) {
     const imageUrl = photo?.src?.large || photo?.src?.medium;
     if (!imageUrl) return null;
     const imgRes = await fetch(imageUrl);
-    if (!imgRes.ok) return null;
+    if (!imgRes.ok) {
+      await imgRes.text().catch(() => {});
+      return null;
+    }
     const buffer = await imgRes.arrayBuffer();
     if (!isUsableImage(buffer)) {
       console.log(`Pexels 이미지가 너무 작아(용량 기준) 못 씀("${query}"): ${buffer.byteLength}바이트`);
@@ -512,7 +522,7 @@ const SITE_ORIGIN = 'https://videos.usb.kr'; // Oracle 릴레이가 외부에서
 
 // Oracle Always Free VM(kiwoomapi 릴레이와 동일 서버)에서 ffmpeg로 직접 렌더링 — 완전 무료,
 // 결과 mp4는 릴레이가 R2(usbkr-videos)에 바로 업로드하므로 Worker는 재다운로드할 필요 없음.
-async function startRelayRender(rawImageKeys, audioKey, outputKey, weights, env) {
+async function startRelayRender(rawImageKeys, audioKey, outputKey, weights, captions, env) {
   if (!env.RELAY_URL || !env.RELAY_SECRET) return { ok: false, error: 'RELAY_URL/RELAY_SECRET 환경변수가 설정 안 됨' };
   if (!rawImageKeys.length) return { ok: false, error: '원본 이미지가 없음' };
 
@@ -523,9 +533,8 @@ async function startRelayRender(rawImageKeys, audioKey, outputKey, weights, env)
     const res = await fetch(`${env.RELAY_URL}/render`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-relay-secret': env.RELAY_SECRET },
-      // weights: 이미지별 자막 글자수 비율 — 릴레이가 오디오 실제 길이(ffprobe)에 이 비율을 곱해서
-      // 이미지마다 노출시간을 다르게 줌(= 자막 분량과 화면 전환 속도가 나레이션과 어긋나지 않게)
-      body: JSON.stringify({ images: imageUrls, audioUrl, outputKey, weights }),
+      // weights: 이미지별 자막 글자수 비율(노출시간 배분용), captions: 이미지별 실제 자막 텍스트(drawtext로 mp4에 번인)
+      body: JSON.stringify({ images: imageUrls, audioUrl, outputKey, weights, captions }),
     });
     if (!res.ok) {
       const bodyText = await res.text();
@@ -831,6 +840,7 @@ async function generateAndSavePost(topic, env) {
   let images = [];
   let rawImageKeys = [];
   let captionWeights = [];
+  let captionTexts = []; // ffmpeg drawtext용 — 줄바꿈까지 미리 적용된 자막 텍스트
   if (env.MEDIA) {
     // 이미지 소스는 저작권이 명확한 것만 사용: Pixabay/Pexels(무료 라이선스) → FLUX(직접 생성) 순서
     const scenes = await generateScenePrompts(topic, article.title, env);
@@ -848,8 +858,10 @@ async function generateAndSavePost(topic, env) {
       await env.MEDIA.put(key, svg, { httpMetadata: { contentType: 'image/svg+xml' } });
       images.push(key);
       captionWeights.push(chunk.weight);
+      // SVG랑 똑같은 줄바꿈 규칙으로 미리 wrap해서 relay에 넘김 — mp4에도 동일한 자막이 그대로 들어가게
+      captionTexts.push(wrapCaptionLines(chunk.text, 26, 3).join('\n'));
 
-      // ffmpeg가 안정적으로 읽을 수 있게 자막 없는 순수 JPEG 원본도 별도 저장 (mp4 렌더링 전용)
+      // ffmpeg가 안정적으로 읽을 수 있게 자막 없는 순수 JPEG 원본도 별도 저장 (mp4 렌더링 전용, 자막은 relay가 drawtext로 입힘)
       const rawKey = `${slug}-raw-${i}.jpg`;
       await env.MEDIA.put(rawKey, rawImages[i], { httpMetadata: { contentType: 'image/jpeg' } });
       rawImageKeys.push(rawKey);
@@ -871,7 +883,7 @@ async function generateAndSavePost(topic, env) {
   // 진짜 mp4 영상(유튜브 업로드용) — 우리가 만든 이미지+음성을 Oracle 릴레이(ffmpeg)로 합성. 기다리지 않고 등록만.
   if (env.RELAY_URL && env.RELAY_SECRET && env.MEDIA && rawImageKeys.length) {
     const outputKey = `${slug}.mp4`;
-    const render = await startRelayRender(rawImageKeys, audioKey, outputKey, captionWeights, env);
+    const render = await startRelayRender(rawImageKeys, audioKey, outputKey, captionWeights, captionTexts, env);
     if (render.ok) {
       await env.POSTS.put(`renderJob:${slug}`, JSON.stringify({
         jobId: render.jobId, slug, r2Key: outputKey, startedAt: Date.now(),
@@ -891,15 +903,15 @@ function renderSlideshow(post) {
   const slides = post.images.map((key, i) => `<img class="slide${i === 0 ? ' active' : ''}" src="/media/${key}" alt="장면 ${i + 1}">`).join('');
   const hasAudio = !!post.audio;
   const audioTag = hasAudio ? `<audio id="narration-${post.slug}" src="/media/${post.audio}" preload="auto"></audio>` : '';
-  // 자동재생이 브라우저 정책으로 막혔을 때만 노출되는 최소 대체 버튼 (평소엔 숨김)
-  const fallbackBtn = hasAudio ? `<button class="playbtn" id="playbtn-${post.slug}" style="display:none;">🔇 소리 켜기</button>` : '';
+  // 자동재생 없음 — 항상 이 버튼을 눌러야 슬라이드쇼(+음성)가 시작됨
+  const playBtn = `<button class="playbtn" id="playbtn-${post.slug}">▶ 재생</button>`;
   const weightsJson = JSON.stringify(Array.isArray(post.captionWeights) ? post.captionWeights : []);
   const script = `<script>
     (function(){
       var root = document.getElementById('slideshow-${post.slug}');
       var slides = root.querySelectorAll('.slide');
       var weights = ${weightsJson};
-      var current = 0, timerId = null;
+      var current = 0, timerId = null, isPlaying = false;
       var DEFAULT_MS = 6000;
       function show(i){ slides.forEach(function(s,idx){ s.classList.toggle('active', idx===i); }); }
       // 자막 글자수 비율(weights)이 있으면 그 비율대로, 없으면 균등 분배 — 어느 쪽이든 합은 totalMs
@@ -913,7 +925,7 @@ function renderSlideshow(post) {
       var currentDurations = durationsFor(DEFAULT_MS * slides.length);
       function scheduleNext(){
         clearTimeout(timerId);
-        if (!slides.length) return;
+        if (!slides.length || !isPlaying) return;
         var d = currentDurations[current] || DEFAULT_MS;
         timerId = setTimeout(function(){
           current = (current + 1) % slides.length;
@@ -921,39 +933,37 @@ function renderSlideshow(post) {
           scheduleNext();
         }, d);
       }
-      scheduleNext();
-      ${hasAudio ? `
-      var audio = document.getElementById('narration-${post.slug}');
       var btn = document.getElementById('playbtn-${post.slug}');
-      function tryAutoplay(){
-        var p = audio.play();
-        if (p && typeof p.catch === 'function') {
-          p.catch(function(){
-            // 브라우저가 자동재생을 막았을 때만 최소 버튼 노출
-            btn.style.display = 'block';
-          });
-        }
+      ${hasAudio ? "var audio = document.getElementById('narration-" + post.slug + "');" : ''}
+      function play(){
+        isPlaying = true;
+        btn.textContent = '⏸ 정지';
+        ${hasAudio ? 'audio.play();' : ''}
+        scheduleNext();
       }
-      window.addEventListener('load', tryAutoplay);
+      function pause(){
+        isPlaying = false;
+        btn.textContent = '▶ 재생';
+        clearTimeout(timerId);
+        ${hasAudio ? 'audio.pause();' : ''}
+      }
       btn.addEventListener('click', function(){
-        audio.play();
-        btn.style.display = 'none';
+        if (isPlaying) pause(); else play();
       });
+      ${hasAudio ? `
       audio.addEventListener('loadedmetadata', function(){
         // 실제 음성 길이를 알면 그 길이 기준으로 각 이미지 노출시간을 자막 비율대로 재계산 (나레이션과 싱크)
         currentDurations = durationsFor(Math.max(4000 * slides.length, audio.duration * 1000));
       });
-      audio.addEventListener('play', function(){
-        btn.style.display = 'none';
-      });
       audio.addEventListener('ended', function(){
         currentDurations = durationsFor(DEFAULT_MS * slides.length);
-        current = 0; show(0); scheduleNext();
+        current = 0; show(0);
+        pause();
       });
       ` : ''}
     })();
   </script>`;
-  return `<div class="slideshow" id="slideshow-${post.slug}">${slides}${fallbackBtn}</div>${audioTag}${script}`;
+  return `<div class="slideshow" id="slideshow-${post.slug}">${slides}${playBtn}</div>${audioTag}${script}`;
 }
 
 async function renderHomePage(env) {
